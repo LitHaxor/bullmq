@@ -10,17 +10,16 @@ Currently, the library does not support all the features available in the NodeJS
 have been ported so far:
 
 - [ ] Add jobs to queues.
-
   - [x] Regular jobs.
   - [x] Delayed jobs.
   - [x] Job deduplication.
-  - [ ] Job priority.
+  - [x] Job priority.
   - [ ] Repeatable.
 
 - [x] Workers
 - [ ] Job events.
 - [x] Job progress.
-- [ ] Job retries.
+- [x] Job retries.
 - [x] Job backoff.
 - [x] Getters.
 
@@ -40,6 +39,24 @@ from bullmq import Queue
 queue = Queue('my-queue')
 
 job = await queue.add('my-job', {'foo': 'bar'})
+```
+
+### Job Priority
+
+Prioritize jobs so higher priority jobs are processed first. Lower number = higher
+priority. `1` is the highest priority and `2_097_152` is the lowest. A priority of
+`0` (the default) means "no priority" and jobs are processed in FIFO order.
+
+```python
+from bullmq import Queue
+
+queue = Queue('my-queue')
+
+# Higher priority job (will be processed first)
+await queue.add('paint', {'color': 'red'}, {'priority': 1})
+
+# Lower priority job
+await queue.add('paint', {'color': 'blue'}, {'priority': 10})
 ```
 
 ### Job Deduplication
@@ -77,8 +94,6 @@ job = await queue.add('paint', {'color': 'white'}, {
     'delay': 5000  # Must be delayed for replace to work
 })
 ```
-
-
 
 ## Documentation
 
