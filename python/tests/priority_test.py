@@ -21,7 +21,7 @@ class TestPriority(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         print("Setting up test queue")
-        queueName = f"__test_queue__{uuid4().hex}"
+        self.queueName = f"__test_queue__{uuid4().hex}"
 
     async def asyncTearDown(self):
         connection = redis.Redis(host='localhost')
@@ -30,7 +30,7 @@ class TestPriority(unittest.IsolatedAsyncioTestCase):
     async def test_add_prioritized_jobs_are_returned_in_priority_order(self):
         """Jobs added with priority should be retrievable via getPrioritized()
         ordered by priority (lowest number first = highest priority)."""
-        queue = Queue(queueName, {"prefix": prefix})
+        queue = Queue(self.queueName, {"prefix": prefix})
 
         job_low = await queue.add("paint", {"color": "blue"}, {"priority": 10})
         job_high = await queue.add("paint", {"color": "red"}, {"priority": 1})
@@ -54,7 +54,7 @@ class TestPriority(unittest.IsolatedAsyncioTestCase):
 
     async def test_priority_is_exposed_on_job_instance(self):
         """Job.priority attribute should reflect the option passed to add()."""
-        queue = Queue(queueName, {"prefix": prefix})
+        queue = Queue(self.queueName, {"prefix": prefix})
 
         job = await queue.add("paint", {"color": "red"}, {"priority": 3})
         default_job = await queue.add("paint", {"color": "white"}, {})
@@ -66,14 +66,14 @@ class TestPriority(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_processes_prioritized_jobs_first(self):
         """Worker should consume highest-priority jobs before lower-priority ones."""
-        queue = Queue(queueName, {"prefix": prefix})
+        queue = Queue(self.queueName, {"prefix": prefix})
 
         # Add a low priority job, then a high priority one.
         await queue.add("paint", {"color": "blue"}, {"priority": 10})
         await queue.add("paint", {"color": "red"}, {"priority": 1})
 
         processed_order: list = []
-        done = asyncio.get_event_loop().create_future()
+        done = asyncio.get_running_loop().create_future()
 
         async def processor(job, token):
             processed_order.append(job.data["color"])
@@ -81,7 +81,7 @@ class TestPriority(unittest.IsolatedAsyncioTestCase):
                 done.set_result(True)
             return job.data["color"]
 
-        worker = Worker(queueName, processor, {"prefix": prefix})
+        worker = Worker(self.queueName, processor, {"prefix": prefix})
 
         try:
             await asyncio.wait_for(done, timeout=10)

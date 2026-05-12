@@ -45,7 +45,7 @@ class JobOptions(TypedDict, total=False):
 
     priority: int
     """
-    Ranges from 1 (highest priority) to 2 097 152 (lowest priority).
+    Ranges from 1 (highest priority) to 2_097_152 (lowest priority).
     Note that using priorities has a slight impact on performance,
     so do not use it if not really needed.
 
