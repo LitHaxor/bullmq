@@ -23,6 +23,7 @@ SCRIPT_DEFINITIONS = {
     "cleanJobsInSet": "cleanJobsInSet-3.lua",
     "drain": "drain-5.lua",
     "extendLock": "extendLock-2.lua",
+    "extendLocks": "extendLocks-1.lua",
     "getCounts": "getCounts-1.lua",
     "getCountsPerPriority": "getCountsPerPriority-4.lua",
     "getRanges": "getRanges-1.lua",
