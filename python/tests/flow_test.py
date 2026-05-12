@@ -358,7 +358,10 @@ class TestJob(unittest.IsolatedAsyncioTestCase):
         )
 
         flow = FlowProducer({}, {"prefix": prefix})
+        good_queue = Queue(good_queue_name, {"prefix": prefix})
         try:
+            # If addBulk raises here, the exception itself fails the
+            # test with a clear traceback — no need to swallow + .fail().
             trees = await flow.addBulk([
                 {
                     "name": "ok-root",
@@ -377,26 +380,24 @@ class TestJob(unittest.IsolatedAsyncioTestCase):
                     },
                 },
             ])
-        except Exception as e:
-            self.fail(
-                f"addBulk should not raise on a missing parent, got {e!r}"
-            )
 
-        self.assertIsNotNone(trees)
-        self.assertEqual(len(trees), 2)
-        # The successful root should have a job id assigned and be
-        # retrievable from Redis.
-        good_id = trees[0]["job"].id
-        self.assertIsNotNone(good_id)
+            self.assertIsNotNone(trees)
+            self.assertEqual(len(trees), 2)
+            # The successful root should have a job id assigned and be
+            # retrievable from Redis.
+            good_id = trees[0]["job"].id
+            self.assertIsNotNone(good_id)
 
-        good_queue = Queue(good_queue_name, {"prefix": prefix})
-        round_tripped = await Job.fromId(good_queue, good_id)
-        self.assertIsNotNone(round_tripped)
-        self.assertEqual(round_tripped.data, {"ok": True})
-
-        await flow.close()
-        await good_queue.obliterate()
-        await good_queue.close()
+            round_tripped = await Job.fromId(good_queue, good_id)
+            self.assertIsNotNone(round_tripped)
+            self.assertEqual(round_tripped.data, {"ok": True})
+        finally:
+            # Ensure connections are released even if any assertion or
+            # the addBulk call itself raises; otherwise leaked Redis
+            # connections can destabilise subsequent tests.
+            await flow.close()
+            await good_queue.obliterate()
+            await good_queue.close()
 
     async def test_root_job_id_round_trips_through_redis(self):
         """After `add`, the returned `jobs_tree["job"].id` must match the

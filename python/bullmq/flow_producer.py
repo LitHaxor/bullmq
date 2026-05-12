@@ -9,9 +9,11 @@ MULTI/EXEC transaction so callers never observe a partial tree.
 Design notes:
 - Adding a single flow and adding many flows in bulk share the same
   building block (`_queue_tree`), which is responsible for queuing one
-  tree onto a pipeline and reporting the pipeline index of its root
-  command. The root index is what lets us map per-tree results back
-  after `pipe.execute()` returns the flat list.
+  tree onto a pipeline and returning the number of commands it queued.
+  Callers (`add`/`addBulk`) accumulate those counts themselves to
+  recover each root's index in the flat list returned by
+  `pipe.execute()`. Counting nodes ourselves avoids reaching into
+  redis-py's private `pipe.command_stack`.
 - `_apply_root_result` is the single place where we translate the
   root command's return value into either a raised exception (strict
   path, used by `add()`) or a silent best-effort id reconciliation
