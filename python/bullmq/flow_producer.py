@@ -88,12 +88,15 @@ class FlowProducer(EventEmitter):
         queue_name = node.get("queueName")
         queue_opts = queues_opts and queues_opts.get(queue_name)
 
-        jobs_opts = queue_opts.get('defaultJobOptions', {}) if queue_opts else {}
-        jobs_opts.update(node.get("opts") or {})
-        job_id = (node.get("opts") or {}).get("jobId") or uuid4().hex
+        # Build a fresh merged dict so we never mutate the
+        # caller-provided `queuesOptions[*].defaultJobOptions`; otherwise
+        # node-level options like `parent`/`jobId` would persist across
+        # subsequent nodes/flows that share the same defaults dict.
+        default_opts = (queue_opts or {}).get('defaultJobOptions') or {}
+        node_opts = node.get("opts") or {}
         parent_opts = parent.get("parentOpts")
-
-        jobs_opts.update({"parent": parent_opts})
+        jobs_opts = {**default_opts, **node_opts, "parent": parent_opts}
+        job_id = node_opts.get("jobId") or uuid4().hex
 
         job = Job(
             queue=queue,
@@ -108,7 +111,6 @@ class FlowProducer(EventEmitter):
         self.scripts.resetQueueKeys(queue_name)
         if len(node_children) > 0:
             parent_id = job_id
-            queue_keys_parent = QueueKeys(prefix or self.opts.get("prefix", "bull"))
 
             await self.scripts.addParentJob(job, pipe)
 
@@ -165,11 +167,10 @@ class FlowProducer(EventEmitter):
         queues_options = opts.get("queuesOptions")
 
         async with self.redisConnection.conn.pipeline(transaction=True) as pipe:
-            jobs_tree, root_index = await self._queue_tree(
-                pipe, flow, queues_options
-            )
+            # Only one tree, so the root command is at index 0.
+            jobs_tree, _ = await self._queue_tree(pipe, flow, queues_options)
             exec_results = await pipe.execute()
-            root_result = self._result_at(exec_results, root_index)
+            root_result = self._result_at(exec_results, 0)
             self._apply_root_result(
                 jobs_tree, root_result, parent_key, strict=True
             )
@@ -191,11 +192,13 @@ class FlowProducer(EventEmitter):
 
         async with self.redisConnection.conn.pipeline(transaction=True) as pipe:
             queued: list[tuple[dict, int]] = []
+            running_index = 0
             for flow in flows:
-                jobs_tree, root_index = await self._queue_tree(
+                jobs_tree, queued_count = await self._queue_tree(
                     pipe, flow, queues_options=None
                 )
-                queued.append((jobs_tree, root_index))
+                queued.append((jobs_tree, running_index))
+                running_index += queued_count
 
             exec_results = await pipe.execute()
 
@@ -215,17 +218,29 @@ class FlowProducer(EventEmitter):
     ) -> tuple[dict, int]:
         """
         Queue one flow (root + children) onto `pipe` and return the
-        resulting `JobNode`-shaped dict together with the pipeline
-        command-stack index at which the root's command was queued.
-        Used by both `add()` and `addBulk()` so the two call sites
-        share the exact same enqueue logic.
+        resulting `JobNode`-shaped dict together with the number of
+        commands that were queued for this tree. Callers track the
+        root-command index themselves by accumulating the returned
+        count. Counting nodes ourselves avoids reaching into redis-py's
+        `pipe.command_stack`, which is not a stable public API.
         """
-        root_index = len(pipe.command_stack)
         parent_opts = flow.get("opts", {}).get("parent", None)
         jobs_tree = await self.addNode(
             flow, {"parentOpts": parent_opts}, queues_options, pipe
         )
-        return jobs_tree, root_index
+        # `addNode` queues exactly one command per visited node
+        # (`addParentJob` for nodes with children, `addJob` for leaves),
+        # so the command count equals the total node count of the tree.
+        return jobs_tree, self._count_nodes(flow)
+
+    @staticmethod
+    def _count_nodes(node: dict) -> int:
+        """Return the total number of nodes in a flow definition (root
+        plus all descendant children)."""
+        return 1 + sum(
+            FlowProducer._count_nodes(child)
+            for child in (node.get("children") or [])
+        )
 
     @staticmethod
     def _result_at(exec_results, index: int):

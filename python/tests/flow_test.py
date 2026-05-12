@@ -346,6 +346,58 @@ class TestJob(unittest.IsolatedAsyncioTestCase):
         await child_queue.obliterate()
         await child_queue.close()
 
+    async def test_addBulk_does_not_raise_on_missing_parent(self):
+        """`addBulk` uses lenient semantics: a root command that
+        returns a negative error code (e.g. parent does not exist)
+        must NOT raise, must still return one tree per input flow,
+        and must reconcile ids for the flows that succeeded."""
+        good_queue_name = f"__test_good_queue__{uuid4().hex}"
+        bad_queue_name = f"__test_bad_queue__{uuid4().hex}"
+        bogus_parent_queue_qname = (
+            f"{prefix}:__test_missing_parent_queue__{uuid4().hex}"
+        )
+
+        flow = FlowProducer({}, {"prefix": prefix})
+        try:
+            trees = await flow.addBulk([
+                {
+                    "name": "ok-root",
+                    "queueName": good_queue_name,
+                    "data": {"ok": True},
+                },
+                {
+                    "name": "orphan-root",
+                    "queueName": bad_queue_name,
+                    "data": {},
+                    "opts": {
+                        "parent": {
+                            "id": uuid4().hex,
+                            "queue": bogus_parent_queue_qname,
+                        }
+                    },
+                },
+            ])
+        except Exception as e:
+            self.fail(
+                f"addBulk should not raise on a missing parent, got {e!r}"
+            )
+
+        self.assertIsNotNone(trees)
+        self.assertEqual(len(trees), 2)
+        # The successful root should have a job id assigned and be
+        # retrievable from Redis.
+        good_id = trees[0]["job"].id
+        self.assertIsNotNone(good_id)
+
+        good_queue = Queue(good_queue_name, {"prefix": prefix})
+        round_tripped = await Job.fromId(good_queue, good_id)
+        self.assertIsNotNone(round_tripped)
+        self.assertEqual(round_tripped.data, {"ok": True})
+
+        await flow.close()
+        await good_queue.obliterate()
+        await good_queue.close()
+
     async def test_root_job_id_round_trips_through_redis(self):
         """After `add`, the returned `jobs_tree["job"].id` must match the
         job that actually lives in Redis. Catches regressions where the
