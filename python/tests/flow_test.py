@@ -284,5 +284,96 @@ class TestJob(unittest.IsolatedAsyncioTestCase):
         await child_queue.obliterate()
         await child_queue.close()
 
+    async def test_add_after_close_returns_none(self):
+        """Adding a flow after the producer is closed must be a no-op
+        rather than raising on a closed connection."""
+        flow = FlowProducer({}, {"prefix": prefix})
+        await flow.close()
+
+        result = await flow.add(
+            {
+                "name": "noop",
+                "queueName": f"__test_queue__{uuid4().hex}",
+                "data": {},
+            }
+        )
+        self.assertIsNone(result)
+
+        bulk_result = await flow.addBulk([
+            {
+                "name": "noop",
+                "queueName": f"__test_queue__{uuid4().hex}",
+                "data": {},
+            }
+        ])
+        self.assertIsNone(bulk_result)
+
+    async def test_add_raises_when_parent_does_not_exist(self):
+        """Adding a flow whose root references a non-existent parent
+        must raise instead of silently dropping the job. Mirrors GH #3264
+        on the Node side."""
+        child_queue_name = f"__test_child_queue__{uuid4().hex}"
+        parent_queue_name = f"__test_parent_queue__{uuid4().hex}"
+
+        bogus_parent_id = uuid4().hex
+        bogus_parent_queue_qname = f"{prefix}:{parent_queue_name}"
+
+        flow = FlowProducer({}, {"prefix": prefix})
+        with self.assertRaises(Exception) as ctx:
+            await flow.add(
+                {
+                    "name": "orphan",
+                    "queueName": child_queue_name,
+                    "data": {},
+                    "opts": {
+                        "parent": {
+                            "id": bogus_parent_id,
+                            "queue": bogus_parent_queue_qname,
+                        }
+                    },
+                }
+            )
+
+        # The Lua script returns ErrorCode.ParentJobNotExist (-5); the
+        # producer attaches the numeric code to the exception so callers
+        # can branch on it.
+        self.assertEqual(getattr(ctx.exception, "code", None), -5)
+        self.assertIn("parent job", str(ctx.exception).lower())
+
+        await flow.close()
+
+        child_queue = Queue(child_queue_name, {"prefix": prefix})
+        await child_queue.obliterate()
+        await child_queue.close()
+
+    async def test_root_job_id_round_trips_through_redis(self):
+        """After `add`, the returned `jobs_tree["job"].id` must match the
+        job that actually lives in Redis. Catches regressions where the
+        FlowProducer fails to reconcile the id with the script result."""
+        local_queue_name = f"__test_queue__{uuid4().hex}"
+
+        flow = FlowProducer({}, {"prefix": prefix})
+        jobs_tree = await flow.add(
+            {
+                "name": "root",
+                "queueName": local_queue_name,
+                "data": {"hello": "world"},
+            }
+        )
+
+        returned_id = jobs_tree["job"].id
+        self.assertIsNotNone(returned_id)
+
+        queue = Queue(local_queue_name, {"prefix": prefix})
+        round_tripped = await Job.fromId(queue, returned_id)
+        self.assertIsNotNone(round_tripped)
+        self.assertEqual(round_tripped.id, returned_id)
+        self.assertEqual(round_tripped.data, {"hello": "world"})
+
+        await flow.close()
+        await queue.obliterate()
+        await queue.close()
+
+
 if __name__ == '__main__':
     unittest.main()
