@@ -31,6 +31,7 @@ class Queue(EventEmitter):
             self.prefix, name, self.redisConnection)
         self.keys = self.scripts.queue_keys.getKeys(name)
         self.qualifiedName = self.scripts.queue_keys.getQueueQualifiedName(name)
+        self._job_scheduler = None
 
     def toKey(self, type: str):
         return self.scripts.queue_keys.toKey(self.name, type)
@@ -434,3 +435,57 @@ class Queue(EventEmitter):
 
     def remove(self, job_id: str, opts: dict = {}):
         return self.scripts.remove(job_id, opts.get("removeChildren", True))
+
+    @property
+    def jobScheduler(self):
+        """
+        Lazily-instantiated JobScheduler bound to this queue. Created
+        on first use so that queues which never schedule pay no cost.
+        """
+        if self._job_scheduler is None:
+            from bullmq.job_scheduler import JobScheduler
+            self._job_scheduler = JobScheduler(self)
+        return self._job_scheduler
+
+    async def upsertJobScheduler(
+        self,
+        job_scheduler_id: str,
+        repeat_opts: dict,
+        job_name: str = None,
+        job_data=None,
+        opts: dict = None,
+        override: bool = True,
+        producer_id: str = None,
+    ):
+        """
+        Create or update a job scheduler. See JobScheduler.upsertJobScheduler.
+        """
+        return await self.jobScheduler.upsertJobScheduler(
+            job_scheduler_id,
+            repeat_opts,
+            job_name or job_scheduler_id,
+            job_data,
+            opts,
+            override=override,
+            producer_id=producer_id,
+        )
+
+    async def removeJobScheduler(self, job_scheduler_id: str) -> int:
+        """Remove a job scheduler. Returns 0 on success, 1 if absent."""
+        return await self.jobScheduler.removeJobScheduler(job_scheduler_id)
+
+    async def isJobScheduler(self, job_scheduler_id: str) -> bool:
+        """Return True if `job_scheduler_id` is a registered scheduler."""
+        return await self.jobScheduler.isJobScheduler(job_scheduler_id)
+
+    async def getJobScheduler(self, job_scheduler_id: str):
+        """Return the JSON-shaped scheduler record, or None."""
+        return await self.jobScheduler.getScheduler(job_scheduler_id)
+
+    async def getJobSchedulers(self, start: int = 0, end: int = -1, asc: bool = False):
+        """Page through registered schedulers."""
+        return await self.jobScheduler.getJobSchedulers(start, end, asc)
+
+    async def getJobSchedulersCount(self) -> int:
+        """Number of registered schedulers."""
+        return await self.jobScheduler.getSchedulersCount()

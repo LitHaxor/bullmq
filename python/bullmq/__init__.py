@@ -12,4 +12,5 @@ from bullmq.job import Job
 from bullmq.flow_producer import FlowProducer
 from bullmq.worker import Worker
 from bullmq.lock_manager import LockManager
+from bullmq.job_scheduler import JobScheduler
 from bullmq.custom_errors import WaitingChildrenError, UnrecoverableError
