@@ -92,8 +92,20 @@ class LockManager:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
+                # Expected: task.cancel() injects CancelledError into the
+                # renewal loop. Swallow only this; anything else points
+                # at a real bug we want to see.
                 pass
+            except Exception as err:
+                # Surface unexpected failures via the worker's event
+                # emitter instead of silently hiding them. Guard the
+                # emit itself so a faulty listener does not break the
+                # close path.
+                try:
+                    self.worker.emit("error", err)
+                except Exception:
+                    pass
         self.tracked_jobs.clear()
 
     async def _renewal_loop(self) -> None:
@@ -141,13 +153,14 @@ class LockManager:
             )
 
             # The Lua script returns a list (possibly empty) of failed ids.
-            # Materialize as a set for O(1) membership during the
-            # succeeded-list comprehension below; otherwise this is
-            # O(n*m) on workers that keep many concurrent active jobs.
-            errored_set = set(errored_job_ids or [])
+            # Keep the original list for the emitted payload so listeners
+            # see the script's ordering and any duplicates verbatim; build
+            # a parallel set purely for O(1) membership when computing the
+            # `succeeded` list, so renewals stay cheap under concurrency.
+            errored_list = list(errored_job_ids or [])
+            errored_set = set(errored_list)
 
-            if errored_set:
-                errored_list = list(errored_set)
+            if errored_list:
                 self.worker.emit("lockRenewalFailed", errored_list)
                 for job_id in errored_list:
                     self.worker.emit(
@@ -162,12 +175,11 @@ class LockManager:
                     {"count": len(succeeded), "jobIds": succeeded},
                 )
         except asyncio.CancelledError:
-            # On 3.8+ CancelledError inherits from BaseException, but a few
-            # libraries still raise compatibility shims that inherit from
-            # Exception, and we want cooperative cancellation during
-            # close() to stay silent regardless. Re-raise before the broad
-            # handler so we don't emit cancellation as an `error` event
-            # and so the renewal task exits responsively.
+            # Re-raise cooperative cancellation before the broad handler
+            # so close() stays silent and the renewal task exits
+            # responsively. (CancelledError inherits from BaseException
+            # on supported Python versions, but the explicit clause
+            # makes the intent unambiguous to future maintainers.)
             raise
         except Exception as err:
             self.worker.emit("error", err)

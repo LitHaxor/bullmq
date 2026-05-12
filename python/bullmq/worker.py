@@ -145,46 +145,56 @@ class Worker(EventEmitter):
 
         token_postfix = 0
 
-        while not self.closed:
-            while not self.waiting and len(self.processing) < self.opts.get("concurrency") and not self.closing:
-                token_postfix+=1
-                token = f'{self.id}:{token_postfix}'
-                
-                # Use retryIfFailed to wrap getNextJob call, similar to TypeScript worker
-                async def get_next_job_wrapped():
-                    return await self.getNextJob(token)
-                
-                waiting_job = asyncio.ensure_future(
-                    self.retryIfFailed(
-                        get_next_job_wrapped,
-                        {
-                            "delay_in_ms": self.opts.get("runRetryDelay"),
-                            "only_emit_error": True,
-                        }
+        try:
+            while not self.closed:
+                while not self.waiting and len(self.processing) < self.opts.get("concurrency") and not self.closing:
+                    token_postfix+=1
+                    token = f'{self.id}:{token_postfix}'
+
+                    # Use retryIfFailed to wrap getNextJob call, similar to TypeScript worker
+                    async def get_next_job_wrapped():
+                        return await self.getNextJob(token)
+
+                    waiting_job = asyncio.ensure_future(
+                        self.retryIfFailed(
+                            get_next_job_wrapped,
+                            {
+                                "delay_in_ms": self.opts.get("runRetryDelay"),
+                                "only_emit_error": True,
+                            }
+                        )
                     )
-                )
-                self.processing.add(waiting_job)
+                    self.processing.add(waiting_job)
 
-            try:
-                jobs, pending = await getCompleted(self.processing, self.emit)
+                try:
+                    jobs, pending = await getCompleted(self.processing, self.emit)
 
-                jobs_to_process = [self.processJob(job, job.token) for job in jobs]
-                processing_jobs = [asyncio.ensure_future(
-                    j) for j in jobs_to_process]
-                pending.update(processing_jobs)
-                self.processing = pending
+                    jobs_to_process = [self.processJob(job, job.token) for job in jobs]
+                    processing_jobs = [asyncio.ensure_future(
+                        j) for j in jobs_to_process]
+                    pending.update(processing_jobs)
+                    self.processing = pending
 
-                if (len(jobs) == 0 or len(self.processing) == 0) and self.closing:
-                    # We are done processing so we can close the queue
-                    break
+                    if (len(jobs) == 0 or len(self.processing) == 0) and self.closing:
+                        # We are done processing so we can close the queue
+                        break
 
-            except Exception as e:
-                # This should never happen or we will have an endless loop
-                traceback.print_exc()
-                return
-
-        self.running = False
-        self.stalledCheckTimer.stop()
+                except Exception as e:
+                    # This should never happen or we will have an endless loop
+                    traceback.print_exc()
+                    return
+        finally:
+            # Ensure background resources are released even when the loop
+            # exits via the broad-exception `return` above; otherwise the
+            # lock renewal task and stalled-check timer would keep hitting
+            # Redis after run() has given up.
+            self.running = False
+            if self.stalledCheckTimer is not None:
+                try:
+                    self.stalledCheckTimer.stop()
+                except Exception:
+                    pass
+            await self.lockManager.close()
 
     async def getNextJob(self, token: str):
         """
