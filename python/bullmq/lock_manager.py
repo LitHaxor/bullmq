@@ -1,0 +1,161 @@
+"""
+Lock renewal manager for BullMQ workers.
+
+Port of `src/classes/lock-manager.ts`. The manager keeps track of every job
+currently being processed by the worker and periodically renews their locks
+atomically via the `extendLocks` Lua script so that other workers do not
+consider them stalled while they are still being processed.
+
+Differences from the Node implementation:
+- Uses an `asyncio.Task` for the renewal loop instead of `setTimeout`.
+- Does not yet expose `AbortController` / `cancelJob` semantics; Python
+  cancellation is handled by `asyncio.Task.cancel()` at the worker level.
+  Re-introducing per-job cancellation is left as a follow-up.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from bullmq.worker import Worker
+
+
+class LockManager:
+    def __init__(
+        self,
+        worker: "Worker",
+        lock_renew_time: int,
+        lock_duration: int,
+        worker_id: str,
+        worker_name: Optional[str] = None,
+    ):
+        """
+        @param worker: The Worker that owns this manager. Used to access
+                       `scripts.extendJobLocks` and to emit events.
+        @param lock_renew_time: Total renewal window in milliseconds. The
+                                renewal loop wakes every `lock_renew_time / 2`
+                                ms; jobs whose stored timestamp is older than
+                                `now - lock_renew_time / 2` are renewed.
+        @param lock_duration: PX value passed to the Lua script (ms).
+        @param worker_id: Unique id of the worker, used for diagnostics.
+        @param worker_name: Optional human-readable worker name.
+        """
+        self.worker = worker
+        self.lock_renew_time = lock_renew_time
+        self.lock_duration = lock_duration
+        self.worker_id = worker_id
+        self.worker_name = worker_name
+        self.tracked_jobs: dict[str, dict] = {}
+        self.closed = False
+        self._renewal_task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        """Start the background renewal loop. Idempotent."""
+        if self.closed or self._renewal_task is not None:
+            return
+        if self.lock_renew_time > 0:
+            self._renewal_task = asyncio.ensure_future(self._renewal_loop())
+
+    def track_job(self, job_id: str, token: str, ts: int) -> None:
+        """Register a job for lock renewal. `ts` is the timestamp (ms) at
+        which the job became active; the manager uses it to decide when the
+        first renewal is due."""
+        if self.closed or not job_id:
+            return
+        self.tracked_jobs[job_id] = {"token": token, "ts": ts}
+
+    def untrack_job(self, job_id: str) -> None:
+        """Stop renewing the lock for the given job. Called when the job
+        completes, fails, or is moved away from the active state."""
+        self.tracked_jobs.pop(job_id, None)
+
+    def get_active_job_count(self) -> int:
+        return len(self.tracked_jobs)
+
+    def get_tracked_job_ids(self) -> list:
+        return list(self.tracked_jobs.keys())
+
+    def is_running(self) -> bool:
+        return (not self.closed) and self._renewal_task is not None
+
+    async def close(self) -> None:
+        """Cancel the renewal loop and forget all tracked jobs. Idempotent."""
+        if self.closed:
+            return
+        self.closed = True
+        task = self._renewal_task
+        self._renewal_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.tracked_jobs.clear()
+
+    async def _renewal_loop(self) -> None:
+        """Wake every `lock_renew_time / 2` ms and renew locks for any
+        tracked job whose stored timestamp is older than half the renewal
+        window. Mirrors the recursive `setTimeout` pattern from Node."""
+        interval = (self.lock_renew_time / 2) / 1000.0
+        try:
+            while not self.closed:
+                await asyncio.sleep(interval)
+                if self.closed:
+                    break
+
+                now = int(time.time() * 1000)
+                threshold = self.lock_renew_time / 2
+                jobs_to_extend: list = []
+
+                # Snapshot the keys: track/untrack may run concurrently from
+                # the worker loop.
+                for job_id in list(self.tracked_jobs.keys()):
+                    tracked = self.tracked_jobs.get(job_id)
+                    if tracked is None:
+                        continue
+                    ts = tracked.get("ts")
+                    if not ts:
+                        tracked["ts"] = now
+                        continue
+                    if ts + threshold < now:
+                        tracked["ts"] = now
+                        jobs_to_extend.append(job_id)
+
+                if jobs_to_extend:
+                    await self._extend_locks(jobs_to_extend)
+        except asyncio.CancelledError:
+            raise
+
+    async def _extend_locks(self, job_ids: list) -> None:
+        try:
+            tokens = [
+                (self.tracked_jobs.get(jid) or {}).get("token", "")
+                for jid in job_ids
+            ]
+            errored_job_ids = await self.worker.scripts.extendJobLocks(
+                job_ids, tokens, self.lock_duration
+            )
+
+            # The Lua script returns a list (possibly empty) of failed ids.
+            errored_job_ids = list(errored_job_ids or [])
+
+            if errored_job_ids:
+                self.worker.emit("lockRenewalFailed", errored_job_ids)
+                for job_id in errored_job_ids:
+                    self.worker.emit(
+                        "error",
+                        Exception(f"could not renew lock for job {job_id}"),
+                    )
+
+            succeeded = [jid for jid in job_ids if jid not in errored_job_ids]
+            if succeeded:
+                self.worker.emit(
+                    "locksRenewed",
+                    {"count": len(succeeded), "jobIds": succeeded},
+                )
+        except Exception as err:
+            self.worker.emit("error", err)

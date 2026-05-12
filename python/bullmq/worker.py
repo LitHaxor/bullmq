@@ -10,6 +10,7 @@ from bullmq.scripts import Scripts
 from bullmq.redis_connection import RedisConnection
 from bullmq.event_emitter import EventEmitter
 from bullmq.job import Job
+from bullmq.lock_manager import LockManager
 from bullmq.timer import Timer
 from bullmq.types import WorkerOptions
 from bullmq.utils import extract_result
@@ -81,6 +82,9 @@ class Worker(EventEmitter):
             "runRetryDelay": 15000,
         }
         final_opts.update(opts or {})
+        # Default lockRenewTime to lockDuration / 2 if not explicitly set.
+        if "lockRenewTime" not in final_opts:
+            final_opts["lockRenewTime"] = final_opts["lockDuration"] / 2
         self.opts = final_opts
         redis_opts = opts.get("connection", {})
         skip_version_check = opts.get("skipVersionCheck", False)
@@ -113,6 +117,14 @@ class Worker(EventEmitter):
         self.clientName = self.qualifiedName + (f":w:{self.workerName}" if self.workerName else "")
         self._client_name_set = False
 
+        self.lockManager = LockManager(
+            self,
+            lock_renew_time=self.opts["lockRenewTime"],
+            lock_duration=self.opts["lockDuration"],
+            worker_id=self.id,
+            worker_name=self.workerName,
+        )
+
         if processor:
             if opts.get("autorun", True):
                 asyncio.ensure_future(self.run())
@@ -123,8 +135,7 @@ class Worker(EventEmitter):
 
         await self._ensure_client_names()
 
-        self.timer = Timer(
-            (self.opts.get("lockDuration") / 2) / 1000, self.extendLocks, self.emit)
+        self.lockManager.start()
         self.stalledCheckTimer = Timer(self.opts.get(
             "stalledInterval") / 1000, self.runStalledJobsCheck, self.emit)
         self.running = True
@@ -171,7 +182,6 @@ class Worker(EventEmitter):
                 return
 
         self.running = False
-        self.timer.stop()
         self.stalledCheckTimer.stop()
 
     async def getNextJob(self, token: str):
@@ -300,7 +310,8 @@ class Worker(EventEmitter):
                 job.opts["removeOnFail"] = self.opts["removeOnFail"]
 
             self.jobs.add((job, token))
-            
+            self.lockManager.track_job(job.id, token, int(time.time() * 1000))
+
             if job.deferredFailure:
                 await job.moveToFailed(UnrecoverableError(job.deferredFailure), token)
                 self.emit("failed", job, UnrecoverableError(job.deferredFailure))
@@ -324,6 +335,7 @@ class Worker(EventEmitter):
                 self.emit("error", err, job)
         finally:
             self.jobs.discard((job, token))
+            self.lockManager.untrack_job(job.id)
 
     async def retryIfFailed(self, fn, opts=None):
         """
@@ -422,22 +434,6 @@ class Worker(EventEmitter):
 
         return False
 
-    async def extendLocks(self):
-        # Renew all the locks for the jobs that are still active
-        try:
-            multi = self.client.pipeline()
-            for job, token in self.jobs:
-                await self.scripts.extendLock(job.id, token, self.opts.get("lockDuration"), multi)
-            result = await multi.execute()
-
-            # result includes an object with locks that may not have been renewed.
-            # We should emit an error for each of those jobs.
-            #    for jobId, err in result.items():
-            #    self.emit("error", "could not renew lock for job " + jobId)
-
-        except Exception as e:
-            traceback.print_exc()
-
     async def runStalledJobsCheck(self):
         try:
             stalled = await self.scripts.moveStalledJobsToWait(self.opts.get("maxStalledCount"), self.opts.get("stalledInterval"))
@@ -460,6 +456,8 @@ class Worker(EventEmitter):
 
         if not force and len(self.processing) > 0:
             await asyncio.wait(self.processing, return_when=asyncio.ALL_COMPLETED)
+
+        await self.lockManager.close()
 
         for conn in (self.blockingRedisConnection, self.redisConnection):
             try:

@@ -677,6 +677,23 @@ class Scripts:
         args = [token, duration, jobId]
         return self.commands["extendLock"](keys, args, client)
 
+    def extendJobLocks(self, job_ids: list, tokens: list, duration: int):
+        """
+        Extend locks for many jobs atomically in a single Lua call.
+
+        Returns the list of job ids whose lock could not be renewed
+        (because the token did not match, the lock was already released,
+        or the SET failed). An empty list means every lock was renewed.
+        """
+        keys = [self.keys['stalled']]
+        args = [
+            self.keys[''],
+            msgpack.packb(tokens, use_bin_type=True),
+            msgpack.packb(job_ids, use_bin_type=True),
+            duration,
+        ]
+        return self.commands["extendLocks"](keys=keys, args=args)
+
     def moveStalledJobsToWait(self, maxStalledCount: int, stalledInterval: int):
         keys = self.getKeys(['stalled', 'wait', 'active',
                             'stalled-check', 'meta', 'paused', 'marker', 'events'])
