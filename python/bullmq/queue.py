@@ -121,6 +121,76 @@ class Queue(EventEmitter):
         """
         return self.client.pttl(self.keys["limiter"])
 
+    async def rateLimit(self, expire_time_ms: int) -> None:
+        """
+        Overrides the rate limit to be active for the next jobs by writing
+        the limiter key with a large value that expires after
+        `expire_time_ms` milliseconds. Mirrors `Queue.rateLimit` in Node.
+        """
+        # 2^53 - 1, equivalent to Number.MAX_SAFE_INTEGER on the Node side.
+        await self.client.set(
+            self.keys["limiter"], 9007199254740991, px=expire_time_ms
+        )
+
+    async def removeRateLimitKey(self) -> int:
+        """
+        Removes the rate limit key. Returns the number of keys removed (0 or 1).
+        """
+        return await self.client.delete(self.keys["limiter"])
+
+    async def setGlobalConcurrency(self, concurrency: int) -> int:
+        """
+        Set the maximum number of jobs that all workers attached to this
+        queue can process in parallel. A value of 1 effectively serializes
+        the queue. Mirrors `Queue.setGlobalConcurrency` in Node.
+        """
+        return await self.client.hset(
+            self.keys["meta"], "concurrency", concurrency
+        )
+
+    async def getGlobalConcurrency(self):
+        """
+        Returns the configured global concurrency value, or None if not set.
+        """
+        value = await self.client.hget(self.keys["meta"], "concurrency")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def removeGlobalConcurrency(self) -> int:
+        """
+        Clear the global concurrency cap. Returns the number of fields removed.
+        """
+        return await self.client.hdel(self.keys["meta"], "concurrency")
+
+    async def setGlobalRateLimit(self, max_jobs: int, duration_ms: int) -> int:
+        """
+        Configure a global rate limit: at most `max_jobs` jobs across all
+        workers within a rolling `duration_ms` window. Mirrors
+        `Queue.setGlobalRateLimit` in Node.
+        """
+        return await self.client.hset(
+            self.keys["meta"], mapping={"max": max_jobs, "duration": duration_ms}
+        )
+
+    async def getGlobalRateLimit(self):
+        """
+        Returns `{"max": int, "duration": int}` if a global rate limit is
+        configured, otherwise None.
+        """
+        max_jobs, duration_ms = await self.client.hmget(
+            self.keys["meta"], "max", "duration"
+        )
+        if max_jobs is None or duration_ms is None:
+            return None
+        try:
+            return {"max": int(max_jobs), "duration": int(duration_ms)}
+        except (TypeError, ValueError):
+            return None
+
     async def get_workers(self):
         """
         Get the worker list related to the queue. i.e. all the known
