@@ -8,9 +8,13 @@ consider them stalled while they are still being processed.
 
 Differences from the Node implementation:
 - Uses an `asyncio.Task` for the renewal loop instead of `setTimeout`.
-- Does not yet expose `AbortController` / `cancelJob` semantics; Python
-  cancellation is handled by `asyncio.Task.cancel()` at the worker level.
-  Re-introducing per-job cancellation is left as a follow-up.
+- Per-job cancellation is implemented via `AbortController`, matching the
+  Node implementation: `track_job(..., should_create_controller=True)`
+  returns an `AbortController` that the worker passes to the processor as
+  an `AbortSignal`. `cancel_job` / `cancel_all_jobs` flip the signal so a
+  cooperating processor can short-circuit. Forced worker shutdown still
+  cancels the underlying `asyncio.Task` so non-cooperating processors
+  cannot block close().
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import TYPE_CHECKING, Optional
+
+from bullmq.abort_controller import AbortController
 
 if TYPE_CHECKING:
     from bullmq.worker import Worker
@@ -59,18 +65,61 @@ class LockManager:
         if self.lock_renew_time > 0:
             self._renewal_task = asyncio.ensure_future(self._renewal_loop())
 
-    def track_job(self, job_id: str, token: str, ts: int) -> None:
+    def track_job(
+        self,
+        job_id: str,
+        token: str,
+        ts: int,
+        should_create_controller: bool = False,
+    ) -> Optional[AbortController]:
         """Register a job for lock renewal. `ts` is the timestamp (ms) at
         which the job became active; the manager uses it to decide when the
-        first renewal is due."""
+        first renewal is due.
+
+        When `should_create_controller` is True, an `AbortController` is
+        created and stored alongside the job so that `cancel_job` can flip
+        its signal. The controller is returned to the caller (the worker)
+        so it can pass the underlying `AbortSignal` into the processor.
+        Returns None when no controller is needed or when the manager is
+        closed.
+        """
+        controller = AbortController() if should_create_controller else None
         if self.closed or not job_id:
-            return
-        self.tracked_jobs[job_id] = {"token": token, "ts": ts}
+            return controller
+        self.tracked_jobs[job_id] = {
+            "token": token,
+            "ts": ts,
+            "abort_controller": controller,
+        }
+        return controller
 
     def untrack_job(self, job_id: str) -> None:
         """Stop renewing the lock for the given job. Called when the job
         completes, fails, or is moved away from the active state."""
         self.tracked_jobs.pop(job_id, None)
+
+    def cancel_job(self, job_id: str, reason: Optional[str] = None) -> bool:
+        """Abort the `AbortSignal` for the given job, if one was created.
+        Returns True if a controller was found and aborted, False
+        otherwise. Mirrors `LockManager.cancelJob` from the Node
+        implementation."""
+        tracked = self.tracked_jobs.get(job_id)
+        if tracked is None:
+            return False
+        controller = tracked.get("abort_controller")
+        if controller is None:
+            return False
+        controller.abort(reason)
+        return True
+
+    def cancel_all_jobs(self, reason: Optional[str] = None) -> None:
+        """Abort the signals of every tracked job that has a controller.
+        Used on forced worker shutdown so cooperating processors can wind
+        down quickly."""
+        for tracked in self.tracked_jobs.values():
+            controller = tracked.get("abort_controller")
+            if controller is not None:
+                controller.abort(reason)
 
     def get_active_job_count(self) -> int:
         return len(self.tracked_jobs)
