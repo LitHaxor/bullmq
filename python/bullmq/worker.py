@@ -82,9 +82,11 @@ class Worker(EventEmitter):
             "runRetryDelay": 15000,
         }
         final_opts.update(opts or {})
-        # Default lockRenewTime to lockDuration / 2 if not explicitly set.
+        # Default lockRenewTime to lockDuration // 2 if not explicitly set.
+        # Use integer division: lock durations are integer milliseconds and
+        # we don't want a float value leaking into user-visible `worker.opts`.
         if "lockRenewTime" not in final_opts:
-            final_opts["lockRenewTime"] = final_opts["lockDuration"] / 2
+            final_opts["lockRenewTime"] = final_opts["lockDuration"] // 2
         self.opts = final_opts
         redis_opts = opts.get("connection", {})
         skip_version_check = opts.get("skipVersionCheck", False)

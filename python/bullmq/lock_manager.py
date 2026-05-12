@@ -141,21 +141,33 @@ class LockManager:
             )
 
             # The Lua script returns a list (possibly empty) of failed ids.
-            errored_job_ids = list(errored_job_ids or [])
+            # Materialize as a set for O(1) membership during the
+            # succeeded-list comprehension below; otherwise this is
+            # O(n*m) on workers that keep many concurrent active jobs.
+            errored_set = set(errored_job_ids or [])
 
-            if errored_job_ids:
-                self.worker.emit("lockRenewalFailed", errored_job_ids)
-                for job_id in errored_job_ids:
+            if errored_set:
+                errored_list = list(errored_set)
+                self.worker.emit("lockRenewalFailed", errored_list)
+                for job_id in errored_list:
                     self.worker.emit(
                         "error",
                         Exception(f"could not renew lock for job {job_id}"),
                     )
 
-            succeeded = [jid for jid in job_ids if jid not in errored_job_ids]
+            succeeded = [jid for jid in job_ids if jid not in errored_set]
             if succeeded:
                 self.worker.emit(
                     "locksRenewed",
                     {"count": len(succeeded), "jobIds": succeeded},
                 )
+        except asyncio.CancelledError:
+            # On 3.8+ CancelledError inherits from BaseException, but a few
+            # libraries still raise compatibility shims that inherit from
+            # Exception, and we want cooperative cancellation during
+            # close() to stay silent regardless. Re-raise before the broad
+            # handler so we don't emit cancellation as an `error` event
+            # and so the renewal task exits responsively.
+            raise
         except Exception as err:
             self.worker.emit("error", err)
