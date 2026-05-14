@@ -63,6 +63,26 @@ class TestGlobalRateLimit(unittest.IsolatedAsyncioTestCase):
         finally:
             await queue.close()
 
+    async def test_remove_global_rate_limit(self):
+        queue = Queue(self.queueName, {"prefix": prefix})
+        try:
+            await queue.setGlobalRateLimit(100, 1000)
+            self.assertEqual(
+                await queue.getGlobalRateLimit(),
+                {"max": 100, "duration": 1000},
+            )
+
+            removed = await queue.removeGlobalRateLimit()
+            # `max` and `duration` were both present.
+            self.assertEqual(removed, 2)
+            self.assertIsNone(await queue.getGlobalRateLimit())
+
+            # Idempotent: removing again is a no-op.
+            removed_again = await queue.removeGlobalRateLimit()
+            self.assertEqual(removed_again, 0)
+        finally:
+            await queue.close()
+
     async def test_rate_limit_writes_limiter_key_with_ttl(self):
         queue = Queue(self.queueName, {"prefix": prefix})
         try:

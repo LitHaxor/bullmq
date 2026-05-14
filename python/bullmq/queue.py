@@ -191,6 +191,16 @@ class Queue(EventEmitter):
         except (TypeError, ValueError):
             return None
 
+    async def removeGlobalRateLimit(self) -> int:
+        """
+        Clear the global rate limit by removing both `max` and `duration`
+        from the queue's meta hash. Mirrors `Queue.removeGlobalRateLimit`
+        in Node and is the counterpart to `setGlobalRateLimit`.
+
+        Returns the number of fields actually removed (0, 1, or 2).
+        """
+        return await self.client.hdel(self.keys["meta"], "max", "duration")
+
     async def get_workers(self):
         """
         Get the worker list related to the queue. i.e. all the known
