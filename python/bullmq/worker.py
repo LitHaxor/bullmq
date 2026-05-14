@@ -17,6 +17,7 @@ from bullmq.utils import extract_result
 
 import asyncio
 import errno
+import inspect
 import re
 import traceback
 import time
@@ -69,10 +70,17 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
 
 
 class Worker(EventEmitter):
-    def __init__(self, name: str, processor: Callable[[Job, str], asyncio.Future], opts: WorkerOptions = {}):
+    def __init__(self, name: str, processor: Callable[..., asyncio.Future], opts: WorkerOptions = {}):
         super().__init__()
         self.name = name
         self.processor = processor
+        # Detect whether the processor wants an `AbortSignal` third argument.
+        # We only allocate per-job AbortControllers when the processor opts in
+        # by declaring a 3rd positional parameter (or `*args`), matching the
+        # Node implementation where `signal` is an optional 3rd parameter in
+        # the `Processor` type and the controller is only created when the
+        # user is interested in it.
+        self._processor_wants_signal = _processor_accepts_signal(processor)
         final_opts = {
             "drainDelay": 5,
             "concurrency": 1,
@@ -322,14 +330,22 @@ class Worker(EventEmitter):
                 job.opts["removeOnFail"] = self.opts["removeOnFail"]
 
             self.jobs.add((job, token))
-            self.lockManager.track_job(job.id, token, int(time.time() * 1000))
+            controller = self.lockManager.track_job(
+                job.id,
+                token,
+                int(time.time() * 1000),
+                should_create_controller=self._processor_wants_signal,
+            )
 
             if job.deferredFailure:
                 await job.moveToFailed(UnrecoverableError(job.deferredFailure), token)
                 self.emit("failed", job, UnrecoverableError(job.deferredFailure))
                 return
 
-            result = await self.processor(job, token)
+            if controller is not None:
+                result = await self.processor(job, token, controller.signal)
+            else:
+                result = await self.processor(job, token)
             if not self.forceClosing:
                 await self.scripts.moveToCompleted(job, result, job.opts.get("removeOnComplete", False), token, fetchNext=False)
                 job.returnvalue = result
@@ -464,6 +480,11 @@ class Worker(EventEmitter):
         self.closing = True
         if force:
             self.forceClosing = True
+            # Abort cooperating processors first so they can observe a
+            # meaningful `reason` via their AbortSignal before the
+            # underlying tasks are cancelled below. Non-cooperating
+            # processors are still preempted by `cancelProcessing()`.
+            self.lockManager.cancel_all_jobs("worker force-closed")
             self.cancelProcessing()
 
         if not force and len(self.processing) > 0:
@@ -504,6 +525,52 @@ class Worker(EventEmitter):
         for job in self.processing:
             if not job.done():
                 job.cancel()
+
+    def cancelJob(self, job_id: str, reason: str | None = None) -> bool:
+        """
+        Cancel a specific in-flight job by aborting its `AbortSignal`.
+
+        Returns True if the job is tracked and an `AbortController` was
+        allocated for it (i.e. the processor was declared with a 3rd
+        `signal` parameter), False otherwise. Cancellation is cooperative:
+        the processor must observe `signal.aborted` (or await
+        `signal.wait()`) to actually short-circuit. Mirrors
+        `Worker.cancelJob` from the Node.js implementation.
+        """
+        return self.lockManager.cancel_job(job_id, reason)
+
+    def cancelAllJobs(self, reason: str | None = None) -> None:
+        """Abort the signals of all currently tracked jobs. Has no effect
+        on jobs whose processors did not opt into the `signal` argument."""
+        self.lockManager.cancel_all_jobs(reason)
+
+
+def _processor_accepts_signal(processor) -> bool:
+    """Return True if `processor` declares a 3rd positional parameter
+    (the `AbortSignal`). Falls back to False for builtins / C callables
+    whose signature cannot be inspected.
+
+    Variadic handling: `*args` is treated as opt-in because the worker
+    invokes the processor positionally. `**kwargs` is NOT opt-in for
+    the same reason — the signal is passed as a positional argument and
+    a processor that only declares `**kwargs` could not bind it without
+    a named `signal=` keyword (which the worker does not use)."""
+    if processor is None:
+        return False
+    try:
+        sig = inspect.signature(processor)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for param in sig.parameters.values():
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+        elif param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+    return positional >= 3
 
 
 async def getCompleted(task_set: set, emit_callback) -> tuple[list[Job], set]:
