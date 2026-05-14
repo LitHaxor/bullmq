@@ -83,9 +83,14 @@ class LockManager:
         Returns None when no controller is needed or when the manager is
         closed.
         """
-        controller = AbortController() if should_create_controller else None
+        # Only allocate the controller after confirming we are going to
+        # track the job. If the manager is closed (or the job_id is
+        # falsy) the caller would otherwise receive a signal that can
+        # never be aborted via `cancel_job`, because nothing was added
+        # to `tracked_jobs`.
         if self.closed or not job_id:
-            return controller
+            return None
+        controller = AbortController() if should_create_controller else None
         self.tracked_jobs[job_id] = {
             "token": token,
             "ts": ts,
@@ -114,8 +119,11 @@ class LockManager:
 
     def cancel_all_jobs(self, reason: Optional[str] = None) -> None:
         """Abort the signals of every tracked job that has a controller.
-        Used on forced worker shutdown so cooperating processors can wind
-        down quickly."""
+
+        Called from `Worker.cancelAllJobs` and from `Worker.close(force=True)`
+        — the forced close path aborts cooperating processors first so they
+        can observe a structured `reason` before the underlying tasks are
+        cancelled."""
         for tracked in self.tracked_jobs.values():
             controller = tracked.get("abort_controller")
             if controller is not None:

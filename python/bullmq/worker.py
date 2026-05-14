@@ -70,15 +70,16 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
 
 
 class Worker(EventEmitter):
-    def __init__(self, name: str, processor: Callable[[Job, str], asyncio.Future], opts: WorkerOptions = {}):
+    def __init__(self, name: str, processor: Callable[..., asyncio.Future], opts: WorkerOptions = {}):
         super().__init__()
         self.name = name
         self.processor = processor
         # Detect whether the processor wants an `AbortSignal` third argument.
         # We only allocate per-job AbortControllers when the processor opts in
-        # by declaring a 3rd parameter (or **kwargs / *args), matching the
-        # Node implementation where `signal` is optional in the type and the
-        # controller is only created when the user is interested in it.
+        # by declaring a 3rd positional parameter (or `*args`), matching the
+        # Node implementation where `signal` is an optional 3rd parameter in
+        # the `Processor` type and the controller is only created when the
+        # user is interested in it.
         self._processor_wants_signal = _processor_accepts_signal(processor)
         final_opts = {
             "drainDelay": 5,
@@ -479,6 +480,11 @@ class Worker(EventEmitter):
         self.closing = True
         if force:
             self.forceClosing = True
+            # Abort cooperating processors first so they can observe a
+            # meaningful `reason` via their AbortSignal before the
+            # underlying tasks are cancelled below. Non-cooperating
+            # processors are still preempted by `cancelProcessing()`.
+            self.lockManager.cancel_all_jobs("worker force-closed")
             self.cancelProcessing()
 
         if not force and len(self.processing) > 0:
@@ -542,8 +548,13 @@ class Worker(EventEmitter):
 def _processor_accepts_signal(processor) -> bool:
     """Return True if `processor` declares a 3rd positional parameter
     (the `AbortSignal`). Falls back to False for builtins / C callables
-    whose signature cannot be inspected. Treats *args / **kwargs as
-    opt-in, matching how Python normally resolves variadic params."""
+    whose signature cannot be inspected.
+
+    Variadic handling: `*args` is treated as opt-in because the worker
+    invokes the processor positionally. `**kwargs` is NOT opt-in for
+    the same reason — the signal is passed as a positional argument and
+    a processor that only declares `**kwargs` could not bind it without
+    a named `signal=` keyword (which the worker does not use)."""
     if processor is None:
         return False
     try:
