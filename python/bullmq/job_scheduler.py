@@ -23,12 +23,16 @@ one, mirroring how the Node side composes `JobScheduler` onto its
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from bullmq.job import Job
+from croniter import CroniterBadCronError, CroniterBadDateError, croniter
+
+from bullmq.job import Job, optsFromJSON
 from bullmq.types import RepeatOptions
 
 if TYPE_CHECKING:
@@ -61,12 +65,24 @@ def _to_millis(value) -> Optional[int]:
 def default_repeat_strategy(millis: int, opts: RepeatOptions) -> Optional[int]:
     """
     Resolve the next iteration timestamp (in epoch millis) for a cron
-    `pattern`. Returns None if no pattern is set or parsing fails.
+    `pattern`. Returns None if no pattern is set.
 
     Mirrors the Node `defaultRepeatStrategy`: when `immediately` is true
     the current wall-clock millis are returned. `startDate` clamps the
     base date forward. `tz` is honoured by evaluating the cron in that
-    timezone via `pytz`.
+    timezone via the stdlib `zoneinfo.ZoneInfo`.
+
+    Raises:
+        ZoneInfoNotFoundError: if `tz` is supplied but does not name a
+            known IANA timezone. Callers can map this to a user-facing
+            ValueError if they prefer.
+        CroniterBadCronError: if `pattern` is not a valid cron expression.
+        CroniterBadDateError: if the cron iterator cannot find a next fire
+            time from the supplied base date.
+
+    These are deliberately surfaced rather than swallowed so that
+    misconfigured schedulers fail loudly at upsert time instead of
+    silently never firing.
     """
     pattern = opts.get("pattern")
     if not pattern:
@@ -81,24 +97,17 @@ def default_repeat_strategy(millis: int, opts: RepeatOptions) -> Optional[int]:
         base_ms = start_ms
 
     tz_name = opts.get("tz")
-    base_dt: datetime
     if tz_name:
-        try:
-            import pytz  # croniter installs pytz transitively
-            tzinfo = pytz.timezone(tz_name)
-            base_dt = datetime.fromtimestamp(base_ms / 1000.0, tz=tzinfo)
-        except Exception:
-            base_dt = datetime.fromtimestamp(base_ms / 1000.0, tz=timezone.utc)
+        # Let `ZoneInfoNotFoundError` propagate; an unknown tz is a
+        # configuration bug, not a value to silently fall back from.
+        tzinfo = ZoneInfo(tz_name)
+        base_dt = datetime.fromtimestamp(base_ms / 1000.0, tz=tzinfo)
     else:
         base_dt = datetime.fromtimestamp(base_ms / 1000.0, tz=timezone.utc)
 
-    try:
-        from croniter import croniter
-        itr = croniter(pattern, base_dt)
-        next_dt = itr.get_next(datetime)
-        return int(next_dt.timestamp() * 1000)
-    except Exception:
-        return None
+    itr = croniter(pattern, base_dt)
+    next_dt = itr.get_next(datetime)
+    return int(next_dt.timestamp() * 1000)
 
 
 class JobScheduler:
@@ -326,7 +335,12 @@ class JobScheduler:
         self, start: int = 0, end: int = -1, asc: bool = False
     ) -> list:
         """Page through registered schedulers. `asc=True` returns
-        earliest-next-fire first."""
+        earliest-next-fire first.
+
+        Issues the per-scheduler `HGETALL` calls concurrently via
+        `asyncio.gather` to avoid an N+1 sequential round-trip on large
+        scheduler counts.
+        """
         repeat_key = self.queue.keys["repeat"]
         if asc:
             raw = await self.queue.client.zrange(
@@ -337,11 +351,21 @@ class JobScheduler:
                 repeat_key, start, end, withscores=True
             )
 
-        out = []
-        for member, score in raw:
-            fields_raw = await self.queue.client.hgetall(
-                f"{repeat_key}:{member}"
+        if not raw:
+            return []
+
+        members = [member for member, _score in raw]
+        scores = [score for _member, score in raw]
+
+        fields_per_member = await asyncio.gather(
+            *(
+                self.queue.client.hgetall(f"{repeat_key}:{member}")
+                for member in members
             )
+        )
+
+        out = []
+        for member, score, fields_raw in zip(members, scores, fields_per_member):
             try:
                 next_millis = int(score)
             except (TypeError, ValueError):
@@ -373,58 +397,99 @@ def _array_to_dict(arr) -> dict:
 def _transform_scheduler_data(
     key: str, fields: dict, next_millis: Optional[int]
 ) -> Optional[dict]:
-    """Mirror `JobScheduler.transformSchedulerData` from the Node port."""
-    if not fields:
-        return None
+    """Mirror `JobScheduler.transformSchedulerData` from the Node port.
 
-    out: dict = {"key": key, "name": fields.get("name"), "next": next_millis}
+    If the per-id hash exists, produce the rich record. Otherwise, fall
+    back to `_key_to_data` for legacy colon-delimited repeatable-job keys
+    that share the same `repeat` sorted set; this keeps
+    `getJobSchedulers` consistent with `getSchedulersCount` (`ZCARD`),
+    which counts every member regardless of whether a hash exists.
+    """
+    if fields:
+        out: dict = {"key": key, "name": fields.get("name"), "next": next_millis}
 
-    def _int(field):
-        try:
-            return int(fields[field])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    ic = _int("ic")
-    if ic is not None:
-        out["iterationCount"] = ic
-    limit = _int("limit")
-    if limit is not None:
-        out["limit"] = limit
-    start_date = _int("startDate")
-    if start_date is not None:
-        out["startDate"] = start_date
-    end_date = _int("endDate")
-    if end_date is not None:
-        out["endDate"] = end_date
-
-    tz = fields.get("tz")
-    if tz:
-        out["tz"] = tz
-    pattern = fields.get("pattern")
-    if pattern:
-        out["pattern"] = pattern
-    every = _int("every")
-    if every is not None:
-        out["every"] = every
-    offset = _int("offset")
-    if offset is not None:
-        out["offset"] = offset
-
-    raw_data = fields.get("data")
-    raw_opts = fields.get("opts")
-    if raw_data or raw_opts:
-        template = {}
-        if raw_data:
+        def _int(field):
             try:
-                template["data"] = json.loads(raw_data)
-            except (TypeError, ValueError):
-                template["data"] = raw_data
-        if raw_opts:
-            try:
-                template["opts"] = json.loads(raw_opts)
-            except (TypeError, ValueError):
-                template["opts"] = raw_opts
-        out["template"] = template
+                return int(fields[field])
+            except (KeyError, TypeError, ValueError):
+                return None
 
+        ic = _int("ic")
+        if ic is not None:
+            out["iterationCount"] = ic
+        limit = _int("limit")
+        if limit is not None:
+            out["limit"] = limit
+        start_date = _int("startDate")
+        if start_date is not None:
+            out["startDate"] = start_date
+        end_date = _int("endDate")
+        if end_date is not None:
+            out["endDate"] = end_date
+
+        tz = fields.get("tz")
+        if tz:
+            out["tz"] = tz
+        pattern = fields.get("pattern")
+        if pattern:
+            out["pattern"] = pattern
+        every = _int("every")
+        if every is not None:
+            out["every"] = every
+        offset = _int("offset")
+        if offset is not None:
+            out["offset"] = offset
+
+        raw_data = fields.get("data")
+        raw_opts = fields.get("opts")
+        if raw_data or raw_opts:
+            template: dict = {}
+            if raw_data:
+                try:
+                    template["data"] = json.loads(raw_data)
+                except (TypeError, ValueError):
+                    template["data"] = raw_data
+            if raw_opts:
+                try:
+                    parsed_opts = json.loads(raw_opts)
+                except (TypeError, ValueError):
+                    parsed_opts = None
+                # Stored opts use the short-key Redis encoding (fpof,
+                # cpof, etc.); decode them back to their public names so
+                # API consumers see the same shape they originally
+                # passed in. Mirrors Node's `Job.optsFromJSON` call in
+                # `getTemplateFromJSON`.
+                if isinstance(parsed_opts, dict):
+                    template["opts"] = optsFromJSON(parsed_opts)
+                else:
+                    template["opts"] = raw_opts if parsed_opts is None else parsed_opts
+            out["template"] = template
+
+        return out
+
+    # TODO: drop the legacy keyToData fallback when legacy repeatable
+    # jobs are no longer supported. Matches the Node implementation.
+    if ":" in key:
+        return _key_to_data(key, next_millis)
+    return None
+
+
+def _key_to_data(key: str, next_millis: Optional[int]) -> dict:
+    """Best-effort decode of a legacy `name:id:endDate:tz:pattern...`
+    repeatable-job key. Mirrors `JobScheduler.keyToData` in the Node
+    port. Fields that fail to parse are returned as `None`."""
+    parts = key.split(":")
+    pattern = ":".join(parts[4:]) if len(parts) > 4 else None
+    out: dict = {
+        "key": key,
+        "name": parts[0] if parts else None,
+        "id": parts[1] if len(parts) > 1 and parts[1] else None,
+        "next": next_millis,
+    }
+    try:
+        out["endDate"] = int(parts[2]) if len(parts) > 2 and parts[2] else None
+    except ValueError:
+        out["endDate"] = None
+    out["tz"] = parts[3] if len(parts) > 3 and parts[3] else None
+    out["pattern"] = pattern or None
     return out

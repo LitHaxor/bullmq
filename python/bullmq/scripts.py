@@ -827,9 +827,13 @@ class Scripts:
         elif code == ErrorCode.JobHasFailedChildren.value:
             return UnrecoverableError(f"Cannot complete job {opts.get('jobId')} because it has at least one failed child. {opts.get('command')}")
         elif code == ErrorCode.SchedulerJobIdCollision.value:
-            return TypeError(f"Job scheduler id collision for {opts.get('command')}")
+            return TypeError(
+                f"Cannot create job scheduler iteration - job ID already exists. {opts.get('command')}"
+            )
         elif code == ErrorCode.SchedulerJobSlotsBusy.value:
-            return TypeError(f"Job scheduler slots busy for {opts.get('command')}")
+            return TypeError(
+                f"Cannot create job scheduler iteration - current and next time slots already have jobs. {opts.get('command')}"
+            )
         else:
             return TypeError(f"Unknown code {str(code)} error for {opts.get('jobId')}. {opts.get('command')}")
 

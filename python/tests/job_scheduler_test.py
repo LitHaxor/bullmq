@@ -6,10 +6,13 @@ import os
 import time
 import unittest
 from uuid import uuid4
+from zoneinfo import ZoneInfoNotFoundError
 
+from croniter import CroniterBadCronError
 import redis.asyncio as redis
 
 from bullmq import Queue
+from bullmq.job_scheduler import default_repeat_strategy, _transform_scheduler_data
 
 
 prefix = os.environ.get("BULLMQ_TEST_PREFIX") or "bull"
@@ -165,6 +168,28 @@ class TestJobScheduler(unittest.IsolatedAsyncioTestCase):
         finally:
             await queue.close()
 
+    async def test_get_scheduler_decodes_template_opts(self):
+        """Stored template opts use the short-key encoding (fpof, idof, ...).
+        `getJobScheduler` must decode them back to their public names."""
+        queue = Queue(self.queueName, {"prefix": prefix})
+        try:
+            await queue.upsertJobScheduler(
+                "decode-id",
+                {"every": 60_000},
+                job_name="decode",
+                job_data={"foo": "bar"},
+                # `failParentOnFailure` encodes to short key `fpof`.
+                opts={"failParentOnFailure": True, "attempts": 3},
+            )
+            scheduler = await queue.getJobScheduler("decode-id")
+            template_opts = scheduler.get("template", {}).get("opts") or {}
+            # The decoded opts must use the public name, not the short key.
+            self.assertNotIn("fpof", template_opts)
+            self.assertTrue(template_opts.get("failParentOnFailure"))
+            self.assertEqual(template_opts.get("attempts"), 3)
+        finally:
+            await queue.close()
+
     async def test_validation_rejects_mutually_exclusive_options(self):
         queue = Queue(self.queueName, {"prefix": prefix})
         try:
@@ -191,6 +216,47 @@ class TestJobScheduler(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             await queue.close()
+
+
+class TestDefaultRepeatStrategy(unittest.TestCase):
+    """Unit tests for default_repeat_strategy: invalid inputs raise so
+    misconfigured schedulers fail loudly at upsert time."""
+
+    def test_invalid_cron_pattern_raises(self):
+        with self.assertRaises(CroniterBadCronError):
+            default_repeat_strategy(0, {"pattern": "not-a-cron"})
+
+    def test_unknown_timezone_raises(self):
+        with self.assertRaises(ZoneInfoNotFoundError):
+            default_repeat_strategy(
+                0, {"pattern": "* * * * *", "tz": "Not/AZone"}
+            )
+
+    def test_immediately_returns_now(self):
+        millis = default_repeat_strategy(
+            0, {"pattern": "* * * * *", "immediately": True}
+        )
+        self.assertIsNotNone(millis)
+        # Within 5s of wall-clock now.
+        self.assertLess(abs(millis - int(time.time() * 1000)), 5000)
+
+
+class TestKeyToDataFallback(unittest.TestCase):
+    """Unit tests for the legacy colon-delimited key fallback."""
+
+    def test_legacy_repeatable_key_decoded(self):
+        result = _transform_scheduler_data(
+            "myname:my-id:1700000000000:UTC:0 0 * * *", {}, 12345
+        )
+        self.assertEqual(result["name"], "myname")
+        self.assertEqual(result["id"], "my-id")
+        self.assertEqual(result["endDate"], 1700000000000)
+        self.assertEqual(result["tz"], "UTC")
+        self.assertEqual(result["pattern"], "0 0 * * *")
+        self.assertEqual(result["next"], 12345)
+
+    def test_non_legacy_key_returns_none(self):
+        self.assertIsNone(_transform_scheduler_data("plain-id", {}, None))
 
 
 if __name__ == "__main__":
