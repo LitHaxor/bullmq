@@ -9,13 +9,14 @@ uniformly with the framework-emitted events.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import redis.asyncio as redis
 
 from bullmq.queue_keys import QueueKeys
 from bullmq.redis_connection import RedisConnection
 from bullmq.types.queue_events_options import QueueEventsProducerOptions
+from bullmq.utils import isRedisVersionLowerThan
 
 
 class QueueEventsProducer:
@@ -49,6 +50,24 @@ class QueueEventsProducer:
         self.qualifiedName = queue_keys.getQueueQualifiedName(name)
 
         self.closing = False
+        # Cached on first publishEvent() so we don't pay the INFO
+        # round-trip per call. None means "not yet validated".
+        self._version_validated = False
+
+    async def _validate_redis_version(self) -> None:
+        """Lazily ensure the connected Redis supports Streams (>= 5.0).
+        Honours `skipVersionCheck` via the underlying RedisConnection."""
+        if self._version_validated:
+            return
+        version = await self.redisConnection.getRedisVersion()
+        if version and isRedisVersionLowerThan(
+            version, RedisConnection.minimum_version
+        ):
+            raise RuntimeError(
+                f"Redis version {version} is below the minimum required "
+                f"({RedisConnection.minimum_version}) for QueueEventsProducer."
+            )
+        self._version_validated = True
 
     async def publishEvent(
         self,
@@ -66,6 +85,8 @@ class QueueEventsProducer:
         """
         if "eventName" not in args:
             raise ValueError("publishEvent requires an 'eventName' key")
+
+        await self._validate_redis_version()
 
         # Build the fields dict in script-friendly order: 'event'
         # first to match the consumer's `args.pop("event", ...)` in

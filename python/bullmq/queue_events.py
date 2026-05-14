@@ -33,6 +33,7 @@ from bullmq.event_emitter import EventEmitter
 from bullmq.queue_keys import QueueKeys
 from bullmq.redis_connection import RedisConnection
 from bullmq.types.queue_events_options import QueueEventsOptions
+from bullmq.utils import isRedisVersionLowerThan
 
 
 # Events whose payload is JSON-encoded by the Lua scripts and must be
@@ -71,6 +72,12 @@ class QueueEvents(EventEmitter):
         connection_opts: Union[dict, str, redis.Redis] = opts.get(
             "connection", {}
         )
+        # `RedisConnection` calls `register_script` for every BullMQ
+        # Lua script on construction. We don't use any of them here,
+        # but `register_script` in redis-py only computes/caches the
+        # SHA client-side -- there's no `SCRIPT LOAD` round-trip until
+        # someone actually calls `EVALSHA`. The extra work is therefore
+        # local, bounded, and dominated by the connection setup itself.
         self.redisConnection = RedisConnection(
             connection_opts,
             skipVersionCheck=opts.get("skipVersionCheck", False),
@@ -109,6 +116,24 @@ class QueueEvents(EventEmitter):
         """
         if self.running:
             raise Exception("QueueEvents is already running.")
+
+        # Register the current task so `close()` can interrupt the
+        # blocking XREAD even when the caller spawned the consumer
+        # themselves (`autorun=False` + `asyncio.create_task(events.run())`).
+        if self._consumer_task is None:
+            self._consumer_task = asyncio.current_task()
+
+        # Validate Redis supports Streams (>= 5.0). `skipVersionCheck=True`
+        # bypasses the INFO round-trip for cases where the caller knows
+        # the server is compatible.
+        version = await self.redisConnection.getRedisVersion()
+        if version and isRedisVersionLowerThan(
+            version, RedisConnection.minimum_version
+        ):
+            raise RuntimeError(
+                f"Redis version {version} is below the minimum required "
+                f"({RedisConnection.minimum_version}) for QueueEvents."
+            )
 
         self.running = True
         try:
@@ -187,7 +212,10 @@ class QueueEvents(EventEmitter):
     async def close(self) -> None:
         """
         Stop consuming events and release the Redis connection.
-        Idempotent: subsequent calls are no-ops.
+        Idempotent: subsequent calls are no-ops. Works for both
+        `autorun=True` (we own the task) and `autorun=False` (the
+        caller spawned `events.run()` themselves — `run` auto-registers
+        the task so we can still cancel it here).
         """
         if self.closing or self.closed:
             return
@@ -195,7 +223,14 @@ class QueueEvents(EventEmitter):
 
         task = self._consumer_task
         self._consumer_task = None
-        if task is not None and not task.done():
+        # Don't cancel a task that is `current_task()` (i.e. close()
+        # was called from inside the consumer loop itself); just let
+        # the closing flag short-circuit the next iteration.
+        if (
+            task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
             # XREAD BLOCK is parked on the socket; cancel forces it to
             # unwind. We swallow CancelledError because that's exactly
             # what we asked for.
