@@ -9,19 +9,23 @@ power all the functionality.
 Currently, the library does not support all the features available in the NodeJS version. The following
 have been ported so far:
 
-- [ ] Add jobs to queues.
+- [x] Add jobs to queues.
   - [x] Regular jobs.
   - [x] Delayed jobs.
   - [x] Job deduplication.
   - [x] Job priority.
-  - [ ] Repeatable.
+  - [x] Repeatable (via [`JobScheduler`](../docs/gitbook/python/job-scheduler.md)).
 
 - [x] Workers
-- [ ] Job events.
+- [x] Job events (via [`QueueEvents`](../docs/gitbook/python/queue-events.md) and `QueueEventsProducer`).
 - [x] Job progress.
 - [x] Job retries.
 - [x] Job backoff.
 - [x] Getters.
+- [x] [Flow Producer](../docs/gitbook/python/flow-producer.md).
+- [x] [Lock Manager](../docs/gitbook/python/lock-manager.md) (batched lock renewal).
+- [x] [Global concurrency and rate limit](../docs/gitbook/python/global-concurrency-and-rate-limit.md).
+- [x] [Per-job cancellation](../docs/gitbook/python/job-cancellation.md) (cooperative `AbortController`).
 
 ## Installation
 
