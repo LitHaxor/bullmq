@@ -17,8 +17,10 @@ basePath = os.path.dirname(os.path.realpath(__file__))
 SCRIPT_DEFINITIONS = {
     "addStandardJob": "addStandardJob-9.lua",
     "addDelayedJob": "addDelayedJob-6.lua",
+    "addJobScheduler": "addJobScheduler-11.lua",
     "addParentJob": "addParentJob-6.lua",
     "addPrioritizedJob": "addPrioritizedJob-9.lua",
+    "getJobScheduler": "getJobScheduler-1.lua",
     "changePriority": "changePriority-7.lua",
     "cleanJobsInSet": "cleanJobsInSet-3.lua",
     "drain": "drain-5.lua",
@@ -39,11 +41,13 @@ SCRIPT_DEFINITIONS = {
     "pause": "pause-7.lua",
     "promote": "promote-9.lua",
     "removeJob": "removeJob-2.lua",
+    "removeJobScheduler": "removeJobScheduler-3.lua",
     "reprocessJob": "reprocessJob-8.lua",
     "retryJob": "retryJob-11.lua",
     "moveJobsToWait": "moveJobsToWait-8.lua",
     "saveStacktrace": "saveStacktrace-1.lua",
     "updateData": "updateData-1.lua",
+    "updateJobScheduler": "updateJobScheduler-12.lua",
     "updateProgress": "updateProgress-3.lua",
 }
 
